@@ -280,6 +280,25 @@ python scripts/03_rsa.py --epochs epochs.npz --condition imagined
 python tests/test_pipeline.py
 ```
 
+### Si l'étape 1 rejette tous les essais
+
+Le script imprime l'amplitude crête-à-crête observée par session. La lire avant
+de toucher au moindre seuil :
+
+- **amplitude médiane de l'ordre de 10–60 µV** → l'échelle est bonne. Si le rejet
+  est malgré tout massif, desserrer `--max-bad-fraction 0.3` ou augmenter
+  `--reject-uv`.
+- **amplitude médiane très loin de cette plage** → le flux LSL n'est pas en
+  microvolts et aucun seuil exprimé en µV n'a de sens. Relancer avec
+  `--scale 1e6` (flux en volts) et vérifier que la médiane revient dans la plage.
+- **pour voir les données sans aucun filtre de qualité** : `--no-reject`.
+
+Le critère porte sur la **proportion de canaux** hors bornes, pas sur le pire
+canal. Sur un montage 64 canaux avec fixation visuelle, exiger que les 64
+restent sous un seuil revient à exiger qu'aucun clignement ni aucune électrode
+bruyante n'ait touché une seule dérivation pendant 2,5 s — ce qui rejette la
+quasi-totalité des essais exploitables.
+
 ### Comment lire le tableau de sortie
 
 - `puissance_lda` / `loso` reproduit le résultat actuel. Toute autre ligne se lit
@@ -311,11 +330,19 @@ Ce qui, par construction, ne peut pas fuir ici :
   classes déséquilibrées, 1/n_classes sous-estime le hasard et rend significatif
   un décodeur qui n'a rien appris.
 
+Et l'ordre des opérations : le filtrage a lieu sur le signal **continu**, avant
+le découpage. Filtrer époque par époque laisse des transitoires de bord, et sur
+un amplificateur couplé en continu comme l'actiCHamp, dont la ligne de base
+dérive de plusieurs millivolts, ces transitoires dépassent l'amplitude de l'EEG
+lui-même.
+
 La suite de tests contient son propre témoin positif et son propre témoin
 négatif : le pipeline doit retrouver un effet planté, et ne doit pas en
-inventer quand il n'y en a pas. Elle a déjà servi — elle a attrapé un bug réel
-dans `distance_riemann`, qui appliquait `eigvalsh` à `A⁻¹B`, matrice non
-symétrique, ce qui corrompait silencieusement les prédictions de `cov_mdm`.
+inventer quand il n'y en a pas. Elle a déjà servi deux fois — elle a attrapé un
+bug dans `distance_riemann`, qui appliquait `eigvalsh` à `A⁻¹B`, matrice non
+symétrique, ce qui corrompait silencieusement les prédictions de `cov_mdm` ;
+et elle porte désormais la non-régression du critère de rejet, qui éliminait
+100 % des essais sur des données parfaitement exploitables.
 
 ## 8. Annotations linguistiques à relire
 

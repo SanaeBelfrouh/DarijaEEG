@@ -11,6 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from darija import cv, riemann, stats                      # noqa: E402
+from darija.preprocess import (                            # noqa: E402
+    bandpass,
+    filter_continuous,
+    looks_like_microvolts,
+    reject_trials,
+)
 from darija.evaluate import evaluate                       # noqa: E402
 from darija.pipelines import build_representations         # noqa: E402
 from synthetic import make_dataset                         # noqa: E402
@@ -133,6 +139,75 @@ def test_recentering_rescues_a_session_shift():
                        recenter=True, n_perm=300, seed=0)
     gain = centred.accuracy - plain.accuracy
     assert gain > 0.03, f"gain du recentrage trop faible : {gain:.4f}"
+
+
+def _realistic_64ch(rng, n_trials=200, n_channels=64, n_times=625):
+    """EEG de scalp plausible : ~35 uV, quelques electrodes bruyantes, clignements."""
+    X = rng.normal(0, 6.0, size=(n_trials, n_channels, n_times))
+    X[:, :4] *= 6.0                                    # electrodes a haute impedance
+    t = np.arange(n_times)
+    for i in np.flatnonzero(rng.random(n_trials) < 0.35):
+        peak = np.exp(-((t - rng.integers(100, 500)) ** 2) / (2 * 25.0 ** 2))
+        X[i, :6] += peak * rng.uniform(150, 400)       # clignement sur les frontales
+    return X
+
+
+def test_rejection_keeps_usable_64_channel_trials():
+    """Non-regression : un critere portant sur le PIRE des 64 canaux rejette tout.
+
+    Sur un montage 64 canaux avec fixation visuelle, quelques derivations
+    frontales depassent 200 uV crete-a-crete des qu'il y a un clignement, et une
+    ou deux electrodes sont toujours plus bruyantes que les autres. Exiger que
+    les 64 restent sous le seuil revient a exiger un enregistrement parfait
+    pendant 2,5 s : le taux de rejet atteint 100 % sur des donnees parfaitement
+    exploitables. Le critere doit porter sur la PROPORTION de canaux atteints."""
+    rng = np.random.default_rng(0)
+    X = _realistic_64ch(rng)
+
+    worst_channel = np.ptp(X, axis=-1).max(axis=1)
+    assert (worst_channel < 200.0).sum() == 0, "le scenario ne reproduit pas le bug"
+
+    keep, report = reject_trials(X, amplitude_uv=150.0, max_bad_fraction=0.15)
+    assert keep.mean() > 0.9, f"{keep.mean():.2%} conserves, {report}"
+    assert 5.0 < report["ptp_median_uv"] < 150.0, report
+
+
+def test_rejection_catches_widespread_artifacts():
+    """Le critere doit rester capable de rejeter ce qui est vraiment mauvais."""
+    rng = np.random.default_rng(1)
+    X = rng.normal(0, 6.0, size=(200, 64, 625))
+    bad = rng.choice(200, 20, replace=False)
+    X[bad] += rng.normal(0, 90.0, size=(20, 64, 1)) * np.linspace(0, 1, 625)
+
+    keep, _ = reject_trials(X)
+    assert not keep[bad].any(), "artefacts generalises non detectes"
+    assert keep.sum() == 180, f"faux rejets : {180 - keep.sum()}"
+
+
+def test_unit_check_flags_non_microvolt_streams():
+    assert looks_like_microvolts(35.0)
+    assert not looks_like_microvolts(3.5e-5)     # flux en volts
+    assert not looks_like_microvolts(4.0e4)      # decalage continu non retire
+
+
+def test_continuous_filtering_beats_per_epoch():
+    """Le filtrage appartient au continu, pas a l'epoque.
+
+    Un amplificateur couple en continu comme l'actiCHamp presente des decalages
+    de ligne de base de plusieurs millivolts. Filtrer chaque epoque separement
+    laisse des transitoires de bord qui gonflent l'amplitude crete-a-crete."""
+    rng = np.random.default_rng(2)
+    sfreq, n = 1000.0, 60000
+    continuous = rng.normal(0, 6.0, size=(4, n)) + 40000.0     # decalage de 40 mV
+
+    filtered = filter_continuous(continuous, sfreq, low=0.5, high=45.0, do_notch=False)
+    starts = range(2000, 20000, 2500)
+    first = np.stack([filtered[:, i:i + 2500] for i in starts])
+
+    raw = np.stack([continuous[:, i:i + 2500] for i in starts])
+    second = bandpass(raw, sfreq, 0.5, 45.0)
+
+    assert np.median(np.ptp(first, axis=-1)) < np.median(np.ptp(second, axis=-1))
 
 
 def test_trial_reconstruction_from_markers():

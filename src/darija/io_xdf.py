@@ -115,6 +115,10 @@ def load_session(
     target_sfreq: float = 250.0,
     conditions: tuple[str, ...] = CONDITIONS,
     session: str | None = None,
+    low: float = 0.5,
+    high: float = 45.0,
+    do_notch: bool = True,
+    scale: float = 1.0,
 ) -> SessionEpochs:
     """Charge une session et decoupe les epoques ancrees sur ``{cond}_start``.
 
@@ -122,6 +126,14 @@ def load_session(
     ``target_sfreq`` pour etre analysables ensemble. Le rapport de decimation est
     entier dans les deux cas (4 et 2), donc ``resample_poly`` ne fait
     qu'appliquer un filtre anti-repliement puis sous-echantillonner.
+
+    L'ordre des operations est impose par la physique du signal : le filtrage a
+    lieu sur le CONTINU, avant le decoupage. Filtrer epoque par epoque laisse des
+    transitoires de bord qui, sur un amplificateur couple en continu, depassent
+    largement l'amplitude de l'EEG lui-meme.
+
+    ``scale`` multiplie les donnees brutes. Il sert quand le flux LSL n'est pas
+    en microvolts : passer 1e6 si le flux est en volts.
     """
     import pyxdf
 
@@ -144,6 +156,14 @@ def load_session(
     stamps = np.asarray(eeg["time_stamps"], float)
     if data.shape[0] != len(ch_names):
         raise RuntimeError(f"{path.name}: {data.shape[0]} canaux mais {len(ch_names)} noms")
+
+    if scale != 1.0:
+        data = data * np.float32(scale)
+
+    # filtrage sur le continu, AVANT le decoupage : voir la note du docstring
+    from .preprocess import filter_continuous
+
+    data = filter_continuous(data, orig_sfreq, low=low, high=high, do_notch=do_notch)
 
     n_samples = int(round((tmax - tmin) * orig_sfreq))
     values = _marker_values(markers)
