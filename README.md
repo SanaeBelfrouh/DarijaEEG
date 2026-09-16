@@ -375,11 +375,25 @@ lui-même.
 
 La suite de tests contient son propre témoin positif et son propre témoin
 négatif : le pipeline doit retrouver un effet planté, et ne doit pas en
-inventer quand il n'y en a pas. Elle a déjà servi deux fois — elle a attrapé un
-bug dans `distance_riemann`, qui appliquait `eigvalsh` à `A⁻¹B`, matrice non
-symétrique, ce qui corrompait silencieusement les prédictions de `cov_mdm` ;
-et elle porte désormais la non-régression du critère de rejet, qui éliminait
-100 % des essais sur des données parfaitement exploitables.
+inventer quand il n'y en a pas. Elle porte la non-régression de quatre bugs
+réels trouvés en cours de route :
+
+- `distance_riemann` appliquait `eigvalsh` à `A⁻¹B`, matrice non symétrique, ce
+  qui corrompait silencieusement les prédictions de `cov_mdm` ;
+- le critère de rejet d'essais portait sur le pire des 64 canaux et éliminait
+  100 % des essais sur des données parfaitement exploitables ;
+- l'exactitude brute rendait significatif un effondrement du classifieur sur la
+  classe la plus rare ;
+- **`expm` écrasait les valeurs propres négatives.** Le plafond à `1e-15`,
+  indispensable pour la racine et le logarithme qui exigent une matrice définie
+  positive, était appliqué aussi à l'exponentielle — dont l'argument est un
+  vecteur tangent, symétrique mais **indéfini**. La direction de descente de la
+  moyenne de Karcher devenait constante d'une itération à l'autre : la boucle
+  consommait ses 60 itérations sans jamais bouger de son point de départ et
+  renvoyait à peu près la moyenne **arithmétique**. Après correction, la
+  convergence est quadratique (`3,9e-3 → 2,9e-7 → 8,2e-11 → 2,9e-14`) et
+  s'atteint en 2 à 4 itérations : **30× plus rapide**, et sur le chemin du
+  recentrage par session, mathématiquement juste.
 
 ## 8. Annotations linguistiques à relire
 

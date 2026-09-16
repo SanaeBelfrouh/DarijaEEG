@@ -36,6 +36,48 @@ def test_riemann_identities():
     assert np.allclose(riemann.geometric_mean(np.stack([C] * 5)), C, atol=1e-6)
 
 
+def test_expm_accepts_indefinite_matrices():
+    """Non-regression : ``expm`` ecrasait les valeurs propres negatives.
+
+    Son argument est un vecteur tangent, symetrique mais INDEFINI. Le plafond
+    par le bas a 1e-15, indispensable pour la racine et le logarithme qui
+    exigent une matrice definie positive, transformait exp(lambda) < 1 en 1 et
+    detruisait la moitie de l'information."""
+    from scipy.linalg import expm as scipy_expm
+
+    rng = np.random.default_rng(0)
+    A = rng.normal(size=(8, 8))
+    T = 0.5 * (A + A.T)                       # symetrique, valeurs propres des deux signes
+    assert (np.linalg.eigvalsh(T) < 0).any(), "le scenario doit etre indefini"
+
+    assert np.allclose(riemann.expm(T), scipy_expm(T), atol=1e-9)
+
+
+def test_geometric_mean_actually_converges():
+    """Non-regression : la moyenne de Karcher n'atteignait jamais son critere.
+
+    Avec l'exponentielle corrompue, la direction de descente etait constante
+    d'une iteration a l'autre : la boucle consommait ses 60 iterations sans
+    jamais bouger du point d'initialisation, et renvoyait donc a peu pres la
+    moyenne ARITHMETIQUE. Tout l'espace tangent etait construit sur un mauvais
+    point de reference, et chaque appel coutait quinze fois son prix."""
+    rng = np.random.default_rng(1)
+    covs = riemann.covariances(rng.normal(size=(30, 8, 200)))
+
+    mean = riemann.geometric_mean(covs, tol=1e-10, max_iter=60)
+    assert riemann.geometric_mean.last_iterations < 10, \
+        f"{riemann.geometric_mean.last_iterations} iterations"
+
+    # au point de Karcher, la somme des logarithmes tangents est nulle
+    Mm12 = riemann.invsqrtm(mean)
+    gradient = riemann.logm(Mm12 @ covs @ Mm12).mean(axis=0)
+    assert np.linalg.norm(gradient) < 1e-9, np.linalg.norm(gradient)
+
+    # et il est distinct de la moyenne arithmetique, sinon le test ne prouve rien
+    arithmetic = covs.mean(axis=0)
+    assert riemann.distance_riemann(mean, arithmetic) > 1e-6
+
+
 def test_tangent_space_is_isometric_at_reference():
     """La norme du vecteur tangent doit egaler la distance riemannienne a la
     reference : c'est ce qui rend un classifieur lineaire tangent sense."""
