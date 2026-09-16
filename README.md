@@ -301,16 +301,53 @@ quasi-totalité des essais exploitables.
 
 ### Comment lire le tableau de sortie
 
-- `puissance_lda` / `loso` reproduit le résultat actuel. Toute autre ligne se lit
-  comme un écart **par rapport à elle, sur exactement les mêmes plis**.
-- `seuil_detectable` donne, ligne par ligne, la plus petite exactitude vraie que
-  ce nombre d'essais permettait de distinguer du hasard. Un p non significatif
-  au-dessous de ce seuil n'est pas une absence d'effet.
-- `classes_manquantes` doit valoir 0. Toute autre valeur signale un découpage
-  dans lequel l'entraînement ne voit pas une classe testée, ce qui pousse
-  mécaniquement l'exactitude sous le hasard.
+La métrique rapportée **et testée** est l'exactitude **équilibrée**
+(`equilibree`), moyenne des rappels par classe. Son niveau de hasard
+(`hasard_eq`) vaut exactement `1/n_classes`, quel que soit le déséquilibre.
+
+L'exactitude brute (`brute`) et le taux de la classe majoritaire
+(`hasard_majo`) restent dans le CSV à titre descriptif, mais ne sont jamais
+testés. Avec des classes déséquilibrées ils produisent des lignes
+ininterprétables : un classifieur qui s'effondre sur la classe la plus **rare**
+obtient une exactitude très inférieure au taux majoritaire tout en étant
+significativement au-dessus de sa propre loi nulle par permutation — celle-ci
+valant `Σ_c P(pred=c)·P(vrai=c)`, elle s'effondre avec lui. D'où des lignes du
+type `0,083 (hasard 0,266) p = 0,010`, arithmétiquement correctes et pourtant
+illisibles. L'exactitude équilibrée ramène un tel effondrement à exactement
+`1/k`.
+
+- `puissance_lda` / `loso` reproduit le résultat de départ. Toute autre ligne se
+  lit comme un écart **par rapport à elle, sur exactement les mêmes plis**.
+- `seuil_eq` donne, ligne par ligne, la plus petite exactitude équilibrée vraie
+  que ce nombre d'essais permettait de distinguer du hasard. Un p non
+  significatif au-dessous de ce seuil n'est pas une absence d'effet. Les classes
+  rares dégradent ce seuil : sa variance vaut `(1/k²)·(1/k)(1−1/k)·Σ_c 1/n_c`,
+  donc une classe à 120 essais pénalise tout le contraste.
+- `nulle_moy` est la moyenne de la loi nulle par permutation. Elle doit tomber
+  sur `hasard_eq` ; un écart signale un problème de découpage.
+- `classes_manquantes` doit valoir 0.
 - La correction de Holm est appliquée **par famille de contraste**, pas
   globalement : c'est le contraste qui définit la question posée.
+
+### Coût de calcul
+
+Les contrastes sont évalués en boucle **interne**. Pour un couple
+(modèle, schéma), les étages qui n'utilisent pas les étiquettes — espace
+tangent, mise à l'échelle — sont ajustés une fois par pli et réutilisés pour
+tous les contrastes partageant le même masque d'essais ; seul le classifieur
+final est réajusté. Sur `bankcov_tangent`, où l'ajustement de six moyennes
+géométriques 64×64 domine, c'est le facteur limitant.
+`tests/test_pipeline.py::test_shared_folds_match_independent_evaluation`
+vérifie que cette mutualisation est exactement neutre sur les prédictions.
+
+Le test de permutation a un chemin rapide pour l'exactitude équilibrée : une
+permutation à l'intérieur des sessions préserve l'effectif de chaque classe, la
+statistique se ramène donc à un `bincount`. 5000 permutations passent de
+plusieurs secondes à 0,2 s.
+
+`cov_mdm` est hors défaut : 300 à 500 s par combinaison, et il s'effondre
+systématiquement sur une classe. Le rajouter avec `--models` si on veut la
+référence sans hyperparamètre.
 
 ## 7. Garde-fous intégrés
 

@@ -17,7 +17,7 @@ from darija.preprocess import (                            # noqa: E402
     looks_like_microvolts,
     reject_trials,
 )
-from darija.evaluate import evaluate                       # noqa: E402
+from darija.evaluate import evaluate, evaluate_many        # noqa: E402
 from darija.pipelines import build_representations         # noqa: E402
 from synthetic import make_dataset                         # noqa: E402
 
@@ -121,7 +121,7 @@ def test_planted_signal_is_recovered():
     reps = build_representations(X, sfreq, bands=((8.0, 13.0),), include=("cov",))
     result = evaluate(reps, y, groups, order, model="cov_tangent",
                       scheme="loso", contrast="mots15", n_perm=400, seed=0)
-    assert result.accuracy > result.chance + 0.10, result.accuracy
+    assert result.balanced_accuracy > result.chance_balanced + 0.10, result.balanced_accuracy
     assert result.pvalue < 0.01, result.pvalue
 
 
@@ -208,6 +208,62 @@ def test_continuous_filtering_beats_per_epoch():
     second = bandpass(raw, sfreq, 0.5, 45.0)
 
     assert np.median(np.ptp(first, axis=-1)) < np.median(np.ptp(second, axis=-1))
+
+
+def test_balanced_accuracy_neutralises_class_collapse():
+    """Non-regression : l'exactitude brute rendait significatif un effondrement.
+
+    Avec des classes desequilibrees, un classifieur qui repond toujours la classe
+    la plus RARE obtient une exactitude tres inferieure au taux de la classe
+    majoritaire, tout en etant au-dessus de sa propre loi nulle par permutation
+    — celle-ci valant somme_c P(pred=c) P(vrai=c), elle s'effondre avec lui. Le
+    banc produisait alors des lignes du type "0,083 (hasard 0,266) p = 0,010".
+
+    L'exactitude equilibree ramene un tel effondrement a exactement 1/k."""
+    y_true = np.repeat(["a", "b", "c"], [100, 50, 10])
+    collapsed = np.full(len(y_true), "c")
+
+    raw = float(np.mean(collapsed == y_true))
+    assert raw < 0.10                                   # tres en dessous de 100/160
+    assert abs(stats.balanced_accuracy(y_true, collapsed) - 1 / 3) < 1e-9
+
+    perfect = y_true.copy()
+    assert stats.balanced_accuracy(y_true, perfect) == 1.0
+
+
+def test_balanced_threshold_penalises_rare_classes():
+    """Le seuil de detectabilite doit se degrader quand une classe est rare."""
+    balanced = stats.minimum_detectable_balanced_accuracy([300] * 6)
+    skewed = stats.minimum_detectable_balanced_accuracy([479, 359, 359, 240, 240, 120])
+    assert skewed > balanced, (balanced, skewed)
+    # a effectif egal, plus de classes => hasard plus bas
+    assert stats.minimum_detectable_balanced_accuracy([120] * 15) < balanced
+
+
+def test_shared_folds_match_independent_evaluation():
+    """Mutualiser les plis entre contrastes ne doit rien changer aux resultats.
+
+    Le prefixe independant des etiquettes est desormais ajuste une fois par pli
+    et reutilise pour tous les contrastes. Ce test verifie que cette
+    optimisation est exactement neutre."""
+    X, y, groups, order, sfreq = make_dataset(
+        n_words=15, n_per_word=6, n_channels=8, n_times=200, effect=0.5, seed=8
+    )
+    from darija import WORDS
+
+    y = np.asarray(WORDS, dtype=object)[[int(w[1:]) for w in y]]
+    reps = build_representations(X, sfreq, bands=((8.0, 13.0),), include=("cov",))
+
+    together = evaluate_many(reps, y, groups, order, model="cov_tangent",
+                             scheme="loso", contrasts=("mots15", "syllabes"), n_perm=100)
+    separate = [
+        evaluate(reps, y, groups, order, model="cov_tangent", scheme="loso",
+                 contrast=name, n_perm=100)
+        for name in ("mots15", "syllabes")
+    ]
+    for a, b in zip(together, separate):
+        assert a.contrast == b.contrast
+        assert np.array_equal(a.y_pred, b.y_pred), a.contrast
 
 
 def test_trial_reconstruction_from_markers():

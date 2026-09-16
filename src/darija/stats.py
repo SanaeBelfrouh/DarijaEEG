@@ -17,8 +17,36 @@ def accuracy(y_true, y_pred) -> float:
     return float(np.mean(np.asarray(y_true) == np.asarray(y_pred)))
 
 
-def permutation_pvalue(y_true, y_pred, groups, n_perm: int = 5000,
-                       seed: int = 0) -> tuple[float, np.ndarray]:
+def balanced_accuracy(y_true, y_pred, labels=None) -> float:
+    """Moyenne des rappels par classe.
+
+    C'est la metrique primaire de ce projet, et non l'exactitude brute. Avec des
+    classes desequilibrees, l'exactitude brute et sa loi nulle par permutation ne
+    repondent pas a la meme question, ce qui produit des lignes absurdes en
+    apparence : un classifieur qui s'effondre sur la classe la plus RARE obtient
+    une exactitude tres inferieure au taux de la classe majoritaire tout en etant
+    significativement au-dessus de sa propre loi nulle, puisque celle-ci vaut
+    somme_c P(pred=c) P(vrai=c) et s'effondre avec lui.
+
+    L'exactitude equilibree n'a pas ce defaut : son niveau de hasard vaut
+    exactement 1/n_classes quel que soit le desequilibre, elle est comparable
+    d'un contraste a l'autre, et un effondrement sur une classe la ramene a
+    1/n_classes au lieu de la faire varier arbitrairement.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    labels = list(labels) if labels is not None else sorted(np.unique(y_true).tolist())
+
+    recalls = []
+    for label in labels:
+        mask = y_true == label
+        if mask.sum():
+            recalls.append(float(np.mean(y_pred[mask] == label)))
+    return float(np.mean(recalls)) if recalls else float("nan")
+
+
+def permutation_pvalue(y_true, y_pred, groups, n_perm: int = 5000, seed: int = 0,
+                       statistic=balanced_accuracy) -> tuple[float, np.ndarray, float]:
     """p par permutation des etiquettes A L'INTERIEUR de chaque session.
 
     Les predictions sont figees ; seules les etiquettes bougent. Permuter
@@ -26,23 +54,47 @@ def permutation_pvalue(y_true, y_pred, groups, n_perm: int = 5000,
     qu'ils proviennent de 8 sessions dont chacune a sa propre derive : la
     distribution nulle serait trop etroite et le p trop optimiste. Permuter dans
     la session preserve la structure de groupe.
+
+    La statistique testee est par defaut l'exactitude equilibree. Renvoie
+    (p, distribution nulle, moyenne de la nulle) : la moyenne de la nulle doit
+    etre rapportee, c'est elle qui dit par rapport a QUOI le p a ete calcule.
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     groups = np.asarray(groups)
-    observed = accuracy(y_true, y_pred)
+    labels = sorted(np.unique(y_true).tolist())
+    observed = statistic(y_true, y_pred, labels)
 
     rng = np.random.default_rng(seed)
     blocks = [np.flatnonzero(groups == g) for g in np.unique(groups)]
-    permuted = y_true.copy()
-    null = np.empty(n_perm)
-    for i in range(n_perm):
-        for block in blocks:
-            permuted[block] = rng.permutation(y_true[block])
-        null[i] = np.mean(permuted == y_pred)
+
+    if statistic is balanced_accuracy:
+        # Chemin rapide. Une permutation a l'interieur des sessions preserve le
+        # multi-ensemble d'etiquettes, donc l'effectif de chaque classe est
+        # constant d'une permutation a l'autre : l'exactitude equilibree se
+        # ramene a un bincount des bonnes reponses divise par ces effectifs.
+        index = {label: i for i, label in enumerate(labels)}
+        true_codes = np.array([index[v] for v in y_true], dtype=np.int64)
+        pred_codes = np.array([index.get(v, -1) for v in y_pred], dtype=np.int64)
+        counts = np.bincount(true_codes, minlength=len(labels)).astype(float)
+
+        permuted = true_codes.copy()
+        null = np.empty(n_perm)
+        for i in range(n_perm):
+            for block in blocks:
+                permuted[block] = rng.permutation(true_codes[block])
+            hits = np.bincount(permuted[permuted == pred_codes], minlength=len(labels))
+            null[i] = np.mean(hits / counts)
+    else:
+        permuted = y_true.copy()
+        null = np.empty(n_perm)
+        for i in range(n_perm):
+            for block in blocks:
+                permuted[block] = rng.permutation(y_true[block])
+            null[i] = statistic(permuted, y_pred, labels)
 
     pvalue = (1.0 + np.sum(null >= observed)) / (n_perm + 1.0)
-    return float(pvalue), null
+    return float(pvalue), null, float(null.mean())
 
 
 def binomial_ci(n_correct: int, n_total: int, alpha: float = 0.05) -> tuple[float, float]:
@@ -78,6 +130,28 @@ def minimum_detectable_accuracy(n: int, chance: float, power: float = 0.80,
             break
         p = new
     return float(min(p, 1.0))
+
+
+def minimum_detectable_balanced_accuracy(class_counts, power: float = 0.80,
+                                         alpha: float = 0.05) -> float:
+    """Seuil de detectabilite de l'exactitude equilibree.
+
+    Sous l'hypothese nulle, le rappel de chaque classe vaut 1/k et sa variance
+    (1/k)(1-1/k)/n_c. L'exactitude equilibree etant leur moyenne, sa variance
+    vaut (1/k^2) (1/k)(1-1/k) somme_c 1/n_c. Les classes rares pesent donc
+    lourd : une classe a 120 essais degrade la sensibilite de tout le contraste,
+    ce qui est exactement la raison de preferer des contrastes equilibres.
+    """
+    counts = np.asarray(list(class_counts), dtype=float)
+    counts = counts[counts > 0]
+    k = len(counts)
+    if k < 2:
+        return float("nan")
+
+    chance = 1.0 / k
+    se = np.sqrt((1.0 / k**2) * chance * (1 - chance) * np.sum(1.0 / counts))
+    z = stats.norm.ppf(1 - alpha) + stats.norm.ppf(power)
+    return float(min(chance + z * se, 1.0))
 
 
 def required_trials(effect: float, chance: float, power: float = 0.80,

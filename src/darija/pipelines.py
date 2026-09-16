@@ -123,63 +123,69 @@ def build_representations(X: np.ndarray, sfreq: float, *, bands=FILTER_BANK,
     return out
 
 
-#: nom du modele -> (representation requise, fabrique du pipeline)
-MODELS: dict[str, tuple[str, callable]] = {
+#: nom du modele -> (representation, fabrique du PREFIXE, fabrique du CLASSIFIEUR)
+#:
+#: Le prefixe regroupe les etages qui n'utilisent PAS les etiquettes (espace
+#: tangent, mise a l'echelle). Les separer du classifieur permet de l'ajuster une
+#: seule fois par pli et de le reutiliser pour tous les contrastes, qui ne
+#: different que par les etiquettes. Sur ``bankcov_tangent``, ou l'ajustement de
+#: six moyennes geometriques 64x64 domine le cout, cela divise le temps par
+#: presque autant qu'il y a de contrastes.
+#:
+#: ``None`` en prefixe signifie que le modele est indissociable de ses
+#: etiquettes : le CSP apprend ses filtres sur les classes, MDM est directement
+#: un classifieur. Ceux-la ne beneficient d'aucune mutualisation.
+MODELS: dict[str, tuple[str, callable | None, callable]] = {
     # ligne de base : ce que fait le pipeline actuel
     "puissance_lda": (
         "puissance",
-        lambda: Pipeline([
-            ("scale", StandardScaler()),
-            ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
-        ]),
+        lambda: StandardScaler(),
+        lambda: LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto"),
     ),
-    "puissance_logreg": (
-        "puissance",
-        lambda: Pipeline([("scale", StandardScaler()), ("clf", _logreg(0.1))]),
-    ),
-    # spatial classique
+    "puissance_logreg": ("puissance", lambda: StandardScaler(), lambda: _logreg(0.1)),
+
+    # spatial classique — filtres appris sur les classes, pas de mutualisation
     "csp_lda": (
         "brut",
+        None,
         lambda: Pipeline([
             ("csp", MulticlassCSP(n_components=2)),
             ("scale", StandardScaler()),
             ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
         ]),
     ),
+
     # riemannien
-    "cov_mdm": ("cov", lambda: MDM()),
+    "cov_mdm": ("cov", None, lambda: MDM()),
     "cov_tangent": (
         "cov",
-        lambda: Pipeline([
-            ("ts", TangentSpace()),
-            ("scale", StandardScaler()),
-            ("clf", _logreg(0.1)),
-        ]),
+        lambda: Pipeline([("ts", TangentSpace()), ("scale", StandardScaler())]),
+        lambda: _logreg(0.1),
     ),
     "bankcov_tangent": (
         "bankcov",
-        lambda: Pipeline([
-            ("ts", BankTangentSpace()),
-            ("scale", StandardScaler()),
-            ("clf", _logreg(0.05)),
-        ]),
+        lambda: Pipeline([("ts", BankTangentSpace()), ("scale", StandardScaler())]),
+        lambda: _logreg(0.05),
     ),
     "augcov_tangent": (
         "augcov",
-        lambda: Pipeline([
-            ("ts", BankTangentSpace()),
-            ("scale", StandardScaler()),
-            ("clf", _logreg(0.02)),
-        ]),
+        lambda: Pipeline([("ts", BankTangentSpace()), ("scale", StandardScaler())]),
+        lambda: _logreg(0.02),
     ),
 }
 
 
-def make_model(name: str):
-    """Instancie un modele de l'echelle."""
+def make_transform(name: str):
+    """Prefixe independant des etiquettes, ou ``None`` s'il n'y en a pas."""
+    factory = MODELS[name][1]
+    return factory() if factory is not None else None
+
+
+def make_classifier(name: str):
+    """Etage final, le seul a voir les etiquettes."""
     if name not in MODELS:
         raise ValueError(f"modele inconnu : {name} (disponibles : {sorted(MODELS)})")
-    return MODELS[name][1]()
+    return MODELS[name][2]()
 
 
 def representation_for(name: str) -> str:

@@ -1,28 +1,43 @@
-"""Moteur d'evaluation : un modele, un schema de plis, un contraste.
+"""Moteur d'evaluation : un modele, un schema de plis, plusieurs contrastes.
 
-Une seule fonction fait tout le travail et renvoie un enregistrement complet :
-exactitude, F1 macro, intervalle de Wilson, p par permutation groupee, matrice
-de confusion, et l'exactitude minimale detectable pour ce nombre d'essais. Ce
-dernier champ est la raison d'etre du module : un p non significatif accompagne
-d'une exactitude minimale detectable de 8,1 % ne dit pas "pas de signal", il dit
-"pas de signal superieur a 8,1 %".
+Deux choix structurent ce module.
+
+**La metrique primaire est l'exactitude equilibree, pas l'exactitude brute.**
+Avec des classes desequilibrees, l'exactitude brute et sa loi nulle par
+permutation ne repondent pas a la meme question. Un classifieur qui s'effondre
+sur la classe la plus rare obtient une exactitude tres inferieure au taux de la
+classe majoritaire tout en etant significativement au-dessus de sa propre loi
+nulle, puisque celle-ci vaut somme_c P(pred=c) P(vrai=c) et s'effondre avec lui.
+On obtient alors des lignes du type "0,083 (hasard 0,266) p = 0,010", qui se
+lisent comme une aberration alors qu'elles sont arithmetiquement correctes.
+L'exactitude equilibree supprime le probleme : son hasard vaut exactement
+1/n_classes quel que soit le desequilibre.
+
+**Les contrastes sont evalues ensemble, plis en boucle externe.** Les etages qui
+n'utilisent pas les etiquettes (espace tangent, mise a l'echelle) sont ajustes
+une fois par pli et reutilises pour tous les contrastes partageant le meme
+masque d'essais. Seul le classifieur est reajuste.
 """
 
 from __future__ import annotations
 
+import warnings
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from .contrasts import apply_contrast
 from .cv import make_splits
-from .pipelines import make_model, representation_for
+from .pipelines import make_classifier, make_transform, representation_for
 from .riemann import recenter_by_group
 from .stats import (
     accuracy,
+    balanced_accuracy,
     binomial_ci,
+    confusion_matrix,
     macro_f1,
-    minimum_detectable_accuracy,
+    minimum_detectable_balanced_accuracy,
     permutation_pvalue,
 )
 
@@ -38,15 +53,16 @@ class Result:
     recentered: bool
     n_trials: int
     n_classes: int
-    chance: float
+    chance_majority: float
+    chance_balanced: float
     accuracy: float
+    balanced_accuracy: float
     macro_f1: float
     ci_low: float
     ci_high: float
     pvalue: float
-    mde: float
-    #: essais de test dont la classe manquait au pli d'entrainement. Doit valoir
-    #: zero ; toute autre valeur invalide l'exactitude de la ligne.
+    null_mean: float
+    mde_balanced: float
     unreachable: int = 0
     labels: list[str] = field(default_factory=list)
     confusion: np.ndarray | None = None
@@ -62,12 +78,17 @@ class Result:
             "recentre": self.recentered,
             "n": self.n_trials,
             "classes": self.n_classes,
-            "hasard": round(self.chance, 4),
-            "exactitude": round(self.accuracy, 4),
-            "f1_macro": round(self.macro_f1, 4),
-            "ic95": f"[{self.ci_low:.3f}, {self.ci_high:.3f}]",
+            # metrique primaire
+            "equilibree": round(self.balanced_accuracy, 4),
+            "hasard_eq": round(self.chance_balanced, 4),
+            "seuil_eq": round(self.mde_balanced, 4),
             "p_perm": round(self.pvalue, 4),
-            "seuil_detectable": round(self.mde, 4),
+            "nulle_moy": round(self.null_mean, 4),
+            # descriptif, jamais teste directement
+            "brute": round(self.accuracy, 4),
+            "hasard_majo": round(self.chance_majority, 4),
+            "f1_macro": round(self.macro_f1, 4),
+            "ic95_brute": f"[{self.ci_low:.3f}, {self.ci_high:.3f}]",
             "classes_manquantes": self.unreachable,
             "significatif": self.pvalue < 0.05,
         }
@@ -84,78 +105,19 @@ def _recenter(representation: np.ndarray, groups: np.ndarray) -> np.ndarray:
     return recenter_by_group(representation, groups)
 
 
-def evaluate(
-    representations: dict[str, np.ndarray],
-    words: np.ndarray,
-    groups: np.ndarray,
-    trial_index: np.ndarray,
-    *,
-    model: str,
-    scheme: str = "loso",
-    contrast: str = "mots15",
-    recenter: bool = False,
-    n_splits: int = 5,
-    n_perm: int = 5000,
-    seed: int = 0,
-) -> Result:
-    """Evalue une combinaison et renvoie l'enregistrement complet."""
-    labels, mask, chance = apply_contrast(contrast, words)
-
-    representation_name = representation_for(model)
-    X = representations[representation_name]
-    if recenter and representation_name not in COVARIANCE_REPRESENTATIONS:
-        raise ValueError(f"recentrage inapplicable a la representation {representation_name}")
-
-    X = X[mask]
-    groups_c = np.asarray(groups)[mask]
-    trial_index_c = np.asarray(trial_index)[mask]
-
-    if recenter:
-        X = _recenter(X, groups_c)
-
-    splits = make_splits(scheme, groups_c, trial_index_c, n_splits=n_splits)
-    predictions = np.empty(len(labels), dtype=object)
-    predicted = np.zeros(len(labels), dtype=bool)
-    unreachable = 0
-
-    for train, test in splits:
-        train_classes = np.unique(labels[train])
-        if len(train_classes) < 2:
-            continue
-        # un essai dont la classe est absente du pli d'entrainement ne peut pas
-        # etre predit correctement : le compter comme une erreur ferait passer
-        # un defaut de decoupage pour un resultat au-dessous du hasard
-        unreachable += int(np.sum(~np.isin(labels[test], train_classes)))
-
-        estimator = make_model(model)
-        estimator.fit(X[train], labels[train])
-        predictions[test] = estimator.predict(X[test])
-        predicted[test] = True
-
-    if unreachable:
-        import warnings
-
-        warnings.warn(
-            f"{model}/{scheme}/{contrast} : {unreachable} essais de test ont une "
-            f"classe absente de leur pli d'entrainement. L'exactitude rapportee "
-            f"est mecaniquement sous le hasard ; verifier que trial_index reflete "
-            f"bien un ordre de presentation aleatoire par rapport aux classes.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-
-    # un schema intra-session ne predit pas forcement tous les essais si une
-    # session manque une classe : on n'evalue que ce qui a ete predit
+def _score(model, scheme, contrast, recenter, labels, predictions, predicted,
+           groups, chance_majority, unreachable, n_perm, seed) -> Result:
     y_true = labels[predicted]
     y_pred = predictions[predicted].astype(object)
-    groups_eval = groups_c[predicted]
-
     classes = sorted(np.unique(np.concatenate([y_true, y_pred])).tolist())
-    acc = accuracy(y_true, y_pred)
-    pvalue, _ = permutation_pvalue(y_true, y_pred, groups_eval, n_perm=n_perm, seed=seed)
-    low, high = binomial_ci(int(round(acc * len(y_true))), len(y_true))
+    present = sorted(np.unique(y_true).tolist())
+    counts = [int(np.sum(y_true == c)) for c in present]
 
-    from .stats import confusion_matrix
+    pvalue, _, null_mean = permutation_pvalue(
+        y_true, y_pred, groups[predicted], n_perm=n_perm, seed=seed
+    )
+    acc = accuracy(y_true, y_pred)
+    low, high = binomial_ci(int(round(acc * len(y_true))), len(y_true))
 
     return Result(
         model=model,
@@ -163,17 +125,113 @@ def evaluate(
         contrast=contrast,
         recentered=recenter,
         n_trials=len(y_true),
-        n_classes=len(np.unique(y_true)),
-        chance=chance,
+        n_classes=len(present),
+        chance_majority=chance_majority,
+        chance_balanced=1.0 / len(present),
         accuracy=acc,
+        balanced_accuracy=balanced_accuracy(y_true, y_pred, present),
         macro_f1=macro_f1(y_true, y_pred, classes),
         ci_low=low,
         ci_high=high,
         pvalue=pvalue,
-        mde=minimum_detectable_accuracy(len(y_true), chance),
+        null_mean=null_mean,
+        mde_balanced=minimum_detectable_balanced_accuracy(counts),
         unreachable=unreachable,
         labels=classes,
         confusion=confusion_matrix(y_true, y_pred, classes),
         y_true=y_true,
         y_pred=y_pred,
     )
+
+
+def evaluate_many(
+    representations: dict[str, np.ndarray],
+    words: np.ndarray,
+    groups: np.ndarray,
+    trial_index: np.ndarray,
+    *,
+    model: str,
+    scheme: str = "loso",
+    contrasts: tuple[str, ...] = ("mots15",),
+    recenter: bool = False,
+    n_splits: int = 5,
+    n_perm: int = 5000,
+    seed: int = 0,
+) -> list[Result]:
+    """Evalue un modele sur plusieurs contrastes en mutualisant les plis.
+
+    Les contrastes qui retiennent les memes essais partagent les memes plis et
+    le meme prefixe ajuste : seul le classifieur final est reajuste pour chacun.
+    """
+    representation_name = representation_for(model)
+    if recenter and representation_name not in COVARIANCE_REPRESENTATIONS:
+        raise ValueError(f"recentrage inapplicable a la representation {representation_name}")
+
+    specs = {name: apply_contrast(name, words) for name in contrasts}
+
+    # les contrastes de meme masque partagent tout le travail independant des
+    # etiquettes ; seul oui_non, qui ne retient que deux mots, a un masque propre
+    by_mask: dict[bytes, list[str]] = defaultdict(list)
+    for name, (_, mask, _) in specs.items():
+        by_mask[mask.tobytes()].append(name)
+
+    results: list[Result] = []
+    for names in by_mask.values():
+        _, mask, _ = specs[names[0]]
+
+        X = representations[representation_name][mask]
+        groups_c = np.asarray(groups)[mask]
+        trial_index_c = np.asarray(trial_index)[mask]
+        if recenter:
+            X = _recenter(X, groups_c)
+
+        splits = make_splits(scheme, groups_c, trial_index_c, n_splits=n_splits)
+
+        predictions = {n: np.empty(int(mask.sum()), dtype=object) for n in names}
+        predicted = {n: np.zeros(int(mask.sum()), dtype=bool) for n in names}
+        unreachable = {n: 0 for n in names}
+
+        for train, test in splits:
+            transform = make_transform(model)
+            if transform is not None:
+                # le prefixe ne voit jamais les etiquettes : il est ajuste une
+                # fois par pli et sert a tous les contrastes de ce masque
+                transform.fit(X[train])
+                X_train, X_test = transform.transform(X[train]), transform.transform(X[test])
+            else:
+                X_train, X_test = X[train], X[test]
+
+            for name in names:
+                labels = specs[name][0]
+                train_classes = np.unique(labels[train])
+                if len(train_classes) < 2:
+                    continue
+                unreachable[name] += int(np.sum(~np.isin(labels[test], train_classes)))
+
+                estimator = make_classifier(model)
+                estimator.fit(X_train, labels[train])
+                predictions[name][test] = estimator.predict(X_test)
+                predicted[name][test] = True
+
+        for name in names:
+            if unreachable[name]:
+                warnings.warn(
+                    f"{model}/{scheme}/{name} : {unreachable[name]} essais de test "
+                    f"ont une classe absente de leur pli d'entrainement.",
+                    RuntimeWarning, stacklevel=2,
+                )
+            results.append(_score(
+                model, scheme, name, recenter, specs[name][0],
+                predictions[name], predicted[name], groups_c,
+                specs[name][2], unreachable[name], n_perm, seed,
+            ))
+
+    order = {name: i for i, name in enumerate(contrasts)}
+    return sorted(results, key=lambda r: order[r.contrast])
+
+
+def evaluate(representations, words, groups, trial_index, *, model, scheme="loso",
+             contrast="mots15", **kwargs) -> Result:
+    """Cas a un seul contraste, conserve pour les tests et l'usage interactif."""
+    return evaluate_many(representations, words, groups, trial_index, model=model,
+                         scheme=scheme, contrasts=(contrast,), **kwargs)[0]
